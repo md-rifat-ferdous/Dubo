@@ -14,7 +14,9 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPushButton,
+    QSlider,
     QSpinBox,
     QSizePolicy,
     QStackedWidget,
@@ -24,7 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from modules.controller.controller import MotionState
-from ui.control_pad import ControlPad3D
+from ui.control_pad import ControlPad3D, FullMotionController
 from ui.glass import GlassPanel, NavButton, StatusPill, caps_label
 from ui.sections import build as build_sections
 from ui.sonar import SonarPanel
@@ -43,26 +45,28 @@ NAV_ITEMS = [
     ("settings", "Settings", "\u25c8"),
 ]
 
-_TYPING_WIDGETS = (QLineEdit, QTextEdit, QSpinBox, QComboBox)
+_TYPING_WIDGETS = (QLineEdit, QTextEdit, QSpinBox, QComboBox, QSlider)
 
 
 class MainWindow(QMainWindow):
     def __init__(self, camera_manager, overlay=None, hud_provider=None,
                  controller=None, keymap=None, service_manager=None,
-                 config_manager=None, telemetry=None, log_dir="logs",
-                 gcs_config=None):
+                 config_manager=None, telemetry=None, thrusters=None,
+                 log_dir="logs", gcs_config=None):
         super().__init__()
         self.camera = camera_manager
         self.overlay = overlay
         self.hud_provider = hud_provider
         self.controller = controller
         self.telemetry = telemetry
+        self.thrusters = thrusters
         self.log_dir = log_dir
         self.gcs = gcs_config or {}
         self.key_speed = 1.0
         self._pressed_actions = set()
+        self._clearing_motion_inputs = False
         self._key_actions = self._build_keymap(keymap or {})
-        self._armed = True
+        self._armed = False
         self._recording = False
         self._writer = None
         self._lights = False
@@ -71,6 +75,7 @@ class MainWindow(QMainWindow):
         self._fps_t = time.time()
         self._boot_t = time.time()
         self._cam_size = (0, 0)
+        self._cam_signal = None
 
         self.setWindowTitle("HYDRION SPECTRA - ROV Controller")
         self.resize(1440, 820)
@@ -81,6 +86,7 @@ class MainWindow(QMainWindow):
             "sensors": hud_provider,
             "controller": controller,
             "telemetry": telemetry,
+            "thrusters": thrusters,
             "log_dir": log_dir,
             "fps": lambda: f"{self._fps:.0f}",
             "uptime": self._uptime_str,
@@ -321,20 +327,30 @@ class MainWindow(QMainWindow):
         self.pad = ControlPad3D(container)
         if self.controller is not None:
             self.pad.motionChanged.connect(
-                lambda motion: self._pad_motion(motion)
+                lambda motion: self._set_motion_input("pad", motion)
             )
         self.pad.show()
 
-        self.heave_hint = QLabel("HEAVE: R / F")
-        self.heave_hint.setStyleSheet(
+        self.full_motion = FullMotionController(container)
+        if self.controller is not None:
+            self.full_motion.motionChanged.connect(
+                lambda motion: self._set_motion_input("full_motion", motion)
+            )
+            self.full_motion.zeroRequested.connect(self._zero_motion)
+            self.full_motion.estopRequested.connect(self._confirm_estop)
+        self.full_motion.show()
+
+        self.motion_hint = QLabel("HOLD A MOVEMENT BUTTON · RELEASE TO ZERO")
+        self.motion_hint.setStyleSheet(
             f"background: rgba(17, 32, 54, 0.55); color: {C['on_surface_variant']}; "
             f"border: 1px solid {C['outline_variant']}; border-radius: 8px; "
             f"padding: 2px 8px; font-size: 11px;"
         )
-        self.heave_hint.setParent(container)
-        self.heave_hint.adjustSize()
-        self.heave_hint.show()
+        self.motion_hint.setParent(container)
+        self.motion_hint.adjustSize()
+        self.motion_hint.show()
 
+        self._refresh_armed()
         self._reposition_overlays()
         return container
 
@@ -386,20 +402,55 @@ class MainWindow(QMainWindow):
         return dock
 
     def _refresh_armed(self):
+        was_armed = self._armed
+        if self.controller is not None:
+            self._armed = bool(getattr(self.controller, "armed", False))
         self.armed_btn.set_active(self._armed)
         self.armed_btn.set_label("ARMED" if self._armed else "DISARMED")
         self.mode_pill.setText("MANUAL" if self._armed else "DISARMED")
         self.mode_pill.set_status("ok" if self._armed else "bad")
+        full_motion = getattr(self, "full_motion", None)
+        if full_motion is not None:
+            full_motion.set_controls_enabled(self._armed)
+        pad = getattr(self, "pad", None)
+        if pad is not None:
+            pad.setEnabled(self._armed)
+        if was_armed and not self._armed:
+            self._clear_motion_inputs()
 
     def _toggle_armed(self):
-        self._armed = not self._armed
         if self.controller is not None:
             if self._armed:
-                self.controller.recover()
+                self.controller.disarm("dashboard")
             else:
-                self.controller.kill()
-            self.controller.set_input("keyboard", MotionState())
+                self.controller.arm()
+        else:
+            self._armed = not self._armed
+        self._armed = bool(getattr(self.controller, "armed", self._armed)) \
+            if self.controller is not None else self._armed
+        self._clear_motion_inputs()
         self.pad.set_yaw(0.0)
+        self._refresh_armed()
+
+    def _zero_motion(self):
+        if self.controller is not None:
+            self.controller.zero()
+        self._clear_motion_inputs()
+        self._refresh_armed()
+
+    def _confirm_estop(self):
+        answer = QMessageBox.question(
+            self,
+            "E-STOP",
+            "Send E-STOP? It remains latched until the ESP32 is power-cycled.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if self.controller is not None:
+            self.controller.emergency_stop()
+        self._clear_motion_inputs()
         self._refresh_armed()
 
     def _toggle_rec(self):
@@ -447,9 +498,28 @@ class MainWindow(QMainWindow):
     def _launch_mission(self):
         self.status_message("MISSION LAUNCH - placeholder", 2000)
 
-    def _pad_motion(self, motion):
-        if self.controller is not None and self._armed:
-            self.controller.set_input("pad", motion)
+    def status_message(self, message, timeout=2000):
+        self.mode_pill.setText(message)
+        QTimer.singleShot(timeout, self._refresh_armed)
+
+    def _set_motion_input(self, source, motion):
+        if self.controller is not None:
+            self.controller.set_input(source, motion if self._armed else MotionState())
+
+    def _clear_motion_inputs(self):
+        if self._clearing_motion_inputs:
+            return
+        self._clearing_motion_inputs = True
+        try:
+            self._pressed_actions.clear()
+            self.pad.clear()
+            self.full_motion.clear()
+            if self.controller is not None:
+                self.controller.set_input("pad", MotionState())
+                self.controller.set_input("full_motion", MotionState())
+                self.controller.set_input("keyboard", MotionState())
+        finally:
+            self._clearing_motion_inputs = False
 
     def _reposition_overlays(self):
         cw = self.camera_container.width()
@@ -460,14 +530,21 @@ class MainWindow(QMainWindow):
         self.sonar.move(cw - self.sonar.width() - m, m)
         self.dock.move(max(0, (cw - self.dock.sizeHint().width()) // 2),
                        ch - self.dock.sizeHint().height() - 12)
+        self.full_motion.move(
+            max(0, (cw - self.full_motion.width()) // 2),
+            max(0, ch - self.dock.sizeHint().height() - self.full_motion.height() - 24),
+        )
+        self.motion_hint.move(
+            max(0, (cw - self.motion_hint.width()) // 2),
+            self.full_motion.y() + self.full_motion.height() + 3,
+        )
         self.pad.move(cw - self.pad.width() - m, ch - self.pad.height() - m)
-        self.heave_hint.move(self.pad.x() - self.heave_hint.sizeHint().width() - 8,
-                             self.pad.y() + self.pad.height() - self.heave_hint.height())
         self._flyout_tab.move(0, ch // 2 - 30)
         fy = self._flyout_tab.y() + 2
         self._flyout_panel.move(20, fy)
-        for w in (self.live, self.sonar, self.telemetry_panel, self.dock, self.pad,
-                  self.heave_hint, self._flyout_tab, self._flyout_panel):
+        for w in (self.live, self.sonar, self.telemetry_panel, self.dock,
+                  self.full_motion, self.motion_hint, self.pad,
+                  self._flyout_tab, self._flyout_panel):
             w.raise_()
 
     def _set_section(self, key):
@@ -502,7 +579,7 @@ class MainWindow(QMainWindow):
             if pressed:
                 self._armed = False
                 if self.controller is not None:
-                    self.controller.kill()
+                    self.controller.emergency_stop()
                 self._refresh_armed()
             return
         if pressed:
@@ -517,20 +594,52 @@ class MainWindow(QMainWindow):
     def eventFilter(self, obj, event):
         if obj is self.camera_container and event.type() == QEvent.Type.Resize:
             self._reposition_overlays()
+        if event.type() in (QEvent.Type.WindowDeactivate, QEvent.Type.ApplicationDeactivate):
+            self._clear_motion_inputs()
+            operations = self._pages.get("operations")
+            if operations is not None:
+                operations.clear_controls()
         if event.type() in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
             focus = QApplication.focusWidget()
             if focus is None or not isinstance(focus, _TYPING_WIDGETS):
                 self._handle_key(event.key(), event.type() == QEvent.Type.KeyPress)
         return super().eventFilter(obj, event)
 
+    def _set_camera_signal(self, has_signal):
+        if self._cam_signal is has_signal:
+            return
+        self._cam_signal = has_signal
+        if has_signal:
+            self.camera_view.setText("")
+            self.live.setText(" \u25cf LIVE: CH-1 MAIN CAM")
+            self.live.setStyleSheet(
+                f"background: rgba(17, 32, 54, 0.55); color: {C['on_surface']}; "
+                f"border: 1px solid {C['outline_variant']}; border-radius: 8px; "
+                f"padding: 3px 10px; font-family: {FONT_DATA}; font-size: 12px;"
+            )
+        else:
+            self.camera_view.setPixmap(QPixmap())
+            self.camera_view.setText("NO SIGNAL\ncamera not detected - retrying")
+            self.live.setText(" \u25cf NO SIGNAL")
+            self.live.setStyleSheet(
+                f"background: rgba(17, 32, 54, 0.55); color: {C['error']}; "
+                f"border: 1px solid {C['error']}; border-radius: 8px; "
+                f"padding: 3px 10px; font-family: {FONT_DATA}; font-size: 12px;"
+            )
+
     def _update_camera(self):
         frame = self.camera.read_frame() if self.camera is not None else None
         if frame is None:
+            self._set_camera_signal(False)
             return
+        self._set_camera_signal(True)
         if self.hud_provider is not None:
+            # In-memory snapshot only: the provider is polled by the 100 ms
+            # service timer, so this 33 ms frame loop never touches the I2C bus.
             state = self.hud_provider.get_state()
             self.sonar.set_state(state)
             if self.overlay is not None:
+                self.overlay.update(state)
                 frame = self.overlay.render(frame, state)
         if self._lights:
             frame = np.clip(frame.astype(np.int16) + 36, 0, 255).astype(np.uint8)
@@ -561,6 +670,7 @@ class MainWindow(QMainWindow):
         self.camera_view.setPixmap(pix)
 
     def _refresh_static(self):
+        self._refresh_armed()
         tcfg = self.gcs.get("telemetry", {})
         self.batt_pill.setText(f"BATT {tcfg.get('bus_voltage', 48.2)}V")
         self.uptime_pill.setText(f"UP {self._uptime_str()}")
@@ -578,9 +688,7 @@ class MainWindow(QMainWindow):
         except OSError:
             pass
         self.foot["STORAGE"].setText(f"STORAGE: {disk}")
-        self.foot["DEPTH"].setText(
-            f"DEPTH: {self.hud_provider.get_state().depth:.1f}m"
-            if self.hud_provider is not None else "DEPTH: --")
+        self.foot["DEPTH"].setText(self._depth_text())
         self.foot["LATENCY"].setText(
             f"LATENCY: {self.gcs.get('latency_ms', 12)}ms")
 
@@ -591,6 +699,15 @@ class MainWindow(QMainWindow):
         upd = getattr(page, "update", None)
         if callable(upd):
             upd()
+
+    def _depth_text(self):
+        """Footer depth from the cached payload; '--' when nothing supplies it."""
+        if self.hud_provider is None:
+            return "DEPTH: --"
+        data = self.hud_provider.get_sensor_data()
+        if not data.get("depth_valid"):
+            return "DEPTH: --"
+        return f"DEPTH: {data['depth']:.1f}m"
 
     def _current_section_key(self):
         for key, widget in self._pages.items():

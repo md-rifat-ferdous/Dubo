@@ -1,4 +1,53 @@
+# --- Virtual environments ---
 .venv/
+venv/
+env/
+
+# --- Python build / cache artifacts ---
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Tool caches ---
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+
+# --- Runtime logs, recordings and snapshots ---
 logs/*.log
+logs/recordings/
+logs/snapshots/
+*.log
+
+# --- Local scratch / manual backups ---
+# Editor and OS "keep a copy for me" files. Never intended for the repo.
+*_backup.py
+*_bak.py
+*.orig
+*.rej
+*~
+.*.swp
+.DS_Store
+Thumbs.db
+
+# --- Local notes and exports (personal, not project source) ---
+Me_and_ai_conversation_related_to_project.pdf
+
+# --- Secrets and machine-local config ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+configs/*.local.yaml

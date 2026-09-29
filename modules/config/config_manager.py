@@ -43,5 +43,16 @@ class ConfigManager(BaseModule):
     def sections(self):
         return list(self.config.keys())
 
+    def update_section(self, section, data):
+        if not isinstance(data, dict):
+            raise TypeError("configuration section must be a mapping")
+        self.config[section] = data
+        path = os.path.join(self.configs_dir, f"{section}.yaml")
+        temporary = f"{path}.tmp"
+        with open(temporary, "w") as stream:
+            yaml.safe_dump({section: data}, stream, sort_keys=False)
+        os.replace(temporary, path)
+        return self.config[section]
+
     def health_check(self):
         return len(self.config) > 0

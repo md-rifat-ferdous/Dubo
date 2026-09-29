@@ -59,7 +59,9 @@ class Application:
         thrusters = None
         if self.config_manager.get("thrusters", "enabled", True):
             thrusters = ThrusterManager(
-                self.config_manager.get_section("thrusters"), sensors=sensors
+                self.config_manager.get_section("thrusters"),
+                sensors=sensors,
+                log_dir=self.logger_manager.log_dir,
             )
         if self.config_manager.get("controller", "enabled", True):
             self.service_manager.register(
@@ -88,6 +90,7 @@ class Application:
             service_manager=self.service_manager,
             config_manager=self.config_manager,
             telemetry=telemetry,
+            thrusters=self.service_manager.get("Thrusters"),
             log_dir=self.logger_manager.log_dir,
             gcs_config=self.config_manager.get_section("gcs") or {},
         )

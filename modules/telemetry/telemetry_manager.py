@@ -130,6 +130,19 @@ class TelemetryManager(BaseModule):
         self._commands.clear()
         return commands
 
+    def inject_command(self, command):
+        if self.link is None:
+            return False
+        inject = getattr(self.link, "inject_command", None)
+        if not callable(inject):
+            self.logger.warning(
+                "Link '%s' does not support command injection",
+                self.config.get("link", "unknown"),
+            )
+            return False
+        inject(command)
+        return True
+
     def stop(self):
         super().stop()
         if self.link is not None:

@@ -25,6 +25,15 @@ class HudOverlay:
         self.crosshair_enabled = cfg.get("crosshair", {}).get("enabled", True)
         self.compass_enabled = cfg.get("compass", {}).get("enabled", True)
         self.depth_alt_enabled = cfg.get("depth_alt", {}).get("enabled", True)
+        self.pitch_ladder_enabled = cfg.get("pitch_ladder", {}).get("enabled", True)
+        self.roll_arc_enabled = cfg.get("roll_arc", {}).get("enabled", True)
+        #: Degrees of pitch per ladder rung, and pixels of arc per degree of roll.
+        self.pitch_step_deg = float(cfg.get("pitch_ladder", {}).get("step_deg", 10.0))
+        self.roll_arc_span_deg = float(cfg.get("roll_arc", {}).get("span_deg", 90.0))
+
+        self._state = None
+        self._imu_valid = True
+        self._depth_valid = True
 
         colors = cfg.get("colors", {})
         self._c = {
@@ -41,7 +50,23 @@ class HudOverlay:
         return tuple(int(v) for v in reversed(rgb[:3]))
 
     def update(self, state):
-        pass
+        """Cache the newest state; pure in-memory, safe to call per frame."""
+        if state is None:
+            self._state = None
+            return
+        self._state = state
+        self._imu_valid = bool(getattr(state, "imu_valid", True))
+        self._depth_valid = bool(getattr(state, "depth_valid", True))
+
+    def _attitude(self, state):
+        """(roll, pitch, yaw) in degrees, tolerant of a bare/None state."""
+        if state is None:
+            return 0.0, 0.0, 0.0
+        return (
+            float(getattr(state, "roll", 0.0) or 0.0),
+            float(getattr(state, "pitch", 0.0) or 0.0),
+            float(getattr(state, "yaw_deg", 0.0) or 0.0),
+        )
 
     def _text(self, frame, text, org, color=None, scale=0.45, thickness=1):
         cv2.putText(frame, text, (org[0] + 1, org[1] + 1),
@@ -79,21 +104,28 @@ class HudOverlay:
     def render(self, frame, state):
         if not self.enabled or frame is None:
             return frame
+        if state is not None:
+            self.update(state)
         h, w = frame.shape[:2]
         if h < 300 or w < 400:
             return frame
+        roll, pitch, yaw = self._attitude(state)
         if self.compass_enabled:
-            self._draw_compass(frame, state, w)
+            self._draw_compass(frame, state, yaw)
         if self.crosshair_enabled:
             self._draw_crosshair(frame, h, w)
+        if self.roll_arc_enabled:
+            self._draw_roll_arc(frame, roll, h, w)
+        if self.pitch_ladder_enabled:
+            self._draw_pitch_ladder(frame, pitch, roll, h, w)
         if self.depth_alt_enabled:
             self._draw_depth(frame, state, h)
             self._draw_alt(frame, state, h, w)
         return frame
 
-    def _draw_compass(self, frame, state, w):
-        cx = w // 2
-        vals = [state.yaw_deg + d for d in (-20, -10, 0, 10, 20)]
+    def _draw_compass(self, frame, state, yaw):
+        cx = frame.shape[1] // 2
+        vals = [yaw + d for d in (-20, -10, 0, 10, 20)]
         widths = [46, 42, 46, 42, 46]
         total = sum(widths) + 40
         x0 = cx - total // 2
@@ -102,15 +134,73 @@ class HudOverlay:
         x = x0 + 10
         self._text(frame, "HDG", (x, y0 + 19), self._c["variant"], 0.4, 1)
         x += 34
+        color = self._c["text"] if self._imu_valid else self._c["variant"]
         for i, v in enumerate(vals):
             hdg = v % 360
             if i == 2:
-                self._text(frame, f"{hdg:03.0f}", (x, y0 + 21),
-                           self._c["text"], 0.55, 2)
+                self._text(frame, f"{hdg:03.0f}", (x, y0 + 21), color, 0.55, 2)
             else:
                 self._text(frame, f"{hdg:03.0f}", (x, y0 + 19),
                            self._c["variant"], 0.4, 1)
             x += widths[i]
+
+    def _draw_roll_arc(self, frame, roll, h, w):
+        """Roll pointer: a fixed arc with a tick that swings with vehicle roll."""
+        cx, cy = w // 2, h // 2
+        radius = 132
+        start, end = 200, 340
+        cv2.ellipse(frame, (cx, cy), (radius, radius), 0, start, end,
+                    self._c["variant"], 1, cv2.LINE_AA)
+        span = max(1.0, self.roll_arc_span_deg)
+        clamped = max(-span, min(span, roll))
+        angle = 270.0 + (clamped / span) * 70.0
+        rad = np.deg2rad(angle)
+        px, py = int(cx + radius * np.cos(rad)), int(cy + radius * np.sin(rad))
+        color = self._c["cyan"] if self._imu_valid else self._c["variant"]
+        cv2.line(frame, (cx, cy), (px, py), color, 2, cv2.LINE_AA)
+        cv2.circle(frame, (px, py), 4, color, -1, cv2.LINE_AA)
+        self._text(frame, f"ROLL {roll:+05.1f}", (cx - 52, cy - radius - 8),
+                   color, 0.42, 1)
+
+    def _draw_pitch_ladder(self, frame, pitch, roll, h, w):
+        """Pitch ladder: rungs slide vertically and rotate with vehicle roll."""
+        if not self._imu_valid:
+            return
+        cx, cy = w // 2, h // 2
+        step = max(1.0, self.pitch_step_deg)
+        px_per_deg = 3.2
+        half = 96
+        base = int(np.clip(-roll, -45.0, 45.0))
+        # Draw the rungs around the current pitch so the horizon stays centred.
+        for rung in range(-2, 3):
+            deg = base + rung * step
+            offset = (deg - pitch) * px_per_deg
+            y = int(cy + offset)
+            if y < cy - h // 3 or y > cy + h // 3:
+                continue
+            length = half if rung == 0 else half - 26
+            color = self._c["cyan"] if rung == 0 else self._c["variant"]
+            thickness = 2 if rung == 0 else 1
+            if deg >= 0:
+                # Positive pitch (nose up) splits the rung and skips the centre.
+                for sign in (-1, 1):
+                    x_end = cx + sign * length
+                    cv2.line(frame, (cx + sign * 22, y), (x_end, y),
+                             color, thickness, cv2.LINE_AA)
+                    if rung != 0:
+                        cv2.line(frame, (x_end, y), (x_end, y + sign * 6),
+                                 color, thickness, cv2.LINE_AA)
+                label = f"{deg:.0f}"
+                self._text(frame, label, (cx - length - 30, y + 4),
+                           color, 0.38, 1)
+            else:
+                cv2.line(frame, (cx - length, y), (cx + length, y),
+                         color, thickness, cv2.LINE_AA)
+                label = f"{abs(deg):.0f}"
+                self._text(frame, label, (cx + length + 6, y + 4),
+                           color, 0.38, 1)
+        self._text(frame, f"PITCH {pitch:+05.1f}", (cx - 52, cy + h // 2 - 18),
+                   self._c["cyan"], 0.42, 1)
 
     def _draw_crosshair(self, frame, h, w):
         cx, cy = w // 2, h // 2
@@ -135,9 +225,12 @@ class HudOverlay:
         pw, ph = 84, 130
         self._panel(frame, x0, yc - ph // 2, x0 + pw, yc + ph // 2, radius=10)
         self._text(frame, "DEPTH", (x0 + 18, yc - 38), self._c["variant"], 0.4, 1)
-        self._text(frame, f"{state.depth:5.1f}", (x0 + 20, yc + 4),
-                   self._c["cyan"], 0.6, 2)
-        self._text(frame, "m", (x0 + 36, yc + 30), self._c["variant"], 0.4, 1)
+        # No depth source (e.g. the IMU-only GY-95T): show "--", never a fake 0.0.
+        value = f"{state.depth:5.1f}" if self._depth_valid else "  -- "
+        color = self._c["cyan"] if self._depth_valid else self._c["variant"]
+        self._text(frame, value, (x0 + 20, yc + 4), color, 0.6, 2)
+        self._text(frame, "m" if self._depth_valid else "N/A",
+                   (x0 + 36, yc + 30), self._c["variant"], 0.4, 1)
 
     def _draw_alt(self, frame, state, h, w):
         yc = h // 2
@@ -146,6 +239,9 @@ class HudOverlay:
         y0 = yc - ph // 2
         self._panel(frame, x1 - pw, y0, x1, y0 + ph, radius=10)
         self._text(frame, "ALT", (x1 - pw + 28, y0 + 24), self._c["variant"], 0.4, 1)
-        self._text(frame, f"{state.alt:4.1f}", (x1 - pw + 24, y0 + 52), self._c["blue"], 0.6, 2)
-        self._text(frame, "m", (x1 - pw + 34, y0 + 78), self._c["variant"], 0.4, 1)
+        value = f"{state.alt:4.1f}" if self._depth_valid else "  -- "
+        color = self._c["blue"] if self._depth_valid else self._c["variant"]
+        self._text(frame, value, (x1 - pw + 24, y0 + 52), color, 0.6, 2)
+        self._text(frame, "m" if self._depth_valid else "N/A",
+                   (x1 - pw + 34, y0 + 78), self._c["variant"], 0.4, 1)
 

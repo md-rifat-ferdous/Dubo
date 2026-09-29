@@ -1,8 +1,33 @@
 sensors:
   enabled: true
-  provider: simulated
+  provider: gy95t
+
+  # GY-95T AHRS/IMU over I2C (PS pin tied to GND selects I2C mode).
+  # The module is a streaming sensor, not a register map: the byte sent before a
+  # read is a start offset into a 45-byte buffer readable only from 0x00..0x2C.
+  i2c_bus: 1
+  i2c_address: 0x52
+  update_interval_ms: 100
+
+  # Single transfers fail intermittently even when the module is healthy, so
+  # reads are retried and reconnection is rate-limited.
+  read_retries: 3
+  reconnect_interval_s: 2.0
+
+  # Byte offsets of roll/pitch/yaw inside the packed payload, plus the scale.
+  # PROVISIONAL: confirm with scripts/gy95t_calibrate.py before trusting attitude.
+  layout:
+    roll_offset: 0x04
+    pitch_offset: 0x06
+    yaw_offset: 0x08
+    scale: 0.0054931640625  # 180.0 / 32768, WitMotion signed int16 over +-180 deg
+
+  # Simulation-first: fall back to the simulated provider if the IMU is missing.
+  fallback_to_simulated: true
+
   sim:
     speed_mps: 0.6
     turn_rate_degps: 20.0
     depth_rate_mps: 0.05
     start_yaw_deg: 45.0
+    seabed_depth_m: 5.2

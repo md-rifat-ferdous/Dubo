@@ -8,7 +8,17 @@ import math
 
 from PySide6.QtCore import QPointF, Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QPainter, QPen
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QSlider,
+    QVBoxLayout,
+    QWidget,
+)
 
 from modules.controller.controller import MotionState
 
@@ -36,6 +46,12 @@ class ControlPad3D(QWidget):
         self._anim = QTimer(self)
         self._anim.timeout.connect(self._tick)
         self._anim.start(50)
+
+    def clear(self):
+        self._drag = False
+        self._joy = QPointF()
+        self._emit()
+        self.update()
 
     def set_yaw(self, value):
         self._yaw_cmd = max(-1.0, min(1.0, value))
@@ -79,6 +95,14 @@ class ControlPad3D(QWidget):
             self._emit()
             self.update()
         event.accept()
+
+    def leaveEvent(self, event):
+        if self._drag:
+            self._drag = False
+            self._joy = QPointF()
+            self._emit()
+            self.update()
+        super().leaveEvent(event)
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -124,3 +148,127 @@ class ControlPad3D(QWidget):
         p.drawText(8, 0, 14, self.SIZE, Qt.AlignVCenter, "L")
         p.drawText(self.SIZE - 22, 0, 14, self.SIZE, Qt.AlignVCenter, "R")
         p.end()
+
+
+class FullMotionController(QFrame):
+    motionChanged = Signal(object)
+    zeroRequested = Signal()
+    estopRequested = Signal()
+
+    AXES = (
+        ("SURGE -", "surge", -1.0),
+        ("SURGE +", "surge", 1.0),
+        ("SWAY -", "sway", -1.0),
+        ("SWAY +", "sway", 1.0),
+        ("HEAVE -", "heave", -1.0),
+        ("HEAVE +", "heave", 1.0),
+        ("YAW -", "yaw", -1.0),
+        ("YAW +", "yaw", 1.0),
+        ("PITCH -", "pitch", -1.0),
+        ("PITCH +", "pitch", 1.0),
+        ("ROLL -", "roll", -1.0),
+        ("ROLL +", "roll", 1.0),
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(
+            "background: rgba(17, 32, 54, 0.82); border: 1px solid "
+            "rgba(100, 255, 218, 0.35); border-radius: 10px;"
+        )
+        self.setFixedSize(292, 246)
+        self._held = set()
+        self._buttons = {}
+        self._boost = QCheckBox("BOOST")
+        self._boost.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._speed = QSlider(Qt.Orientation.Horizontal)
+        self._speed.setRange(0, 1000)
+        self._speed.setValue(300)
+        self._speed.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._speed_label = QLabel("300")
+        self._build()
+        self._speed.valueChanged.connect(self._update_speed)
+        self._boost.toggled.connect(self._emit)
+        self._update_speed(self._speed.value())
+
+    def _build(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 8, 10, 8)
+        root.setSpacing(6)
+        title = QLabel("MOVEMENT CONTROL")
+        title.setStyleSheet("color: #64ffda; font-weight: 700; letter-spacing: 1px;")
+        root.addWidget(title)
+        speed = QHBoxLayout()
+        speed.setSpacing(6)
+        speed.addWidget(QLabel("SPEED"))
+        speed.addWidget(self._speed, 1)
+        speed.addWidget(self._speed_label)
+        root.addLayout(speed)
+        grid = QGridLayout()
+        grid.setSpacing(4)
+        for index, (label, axis, direction) in enumerate(self.AXES):
+            button = QPushButton(label)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            button.setMinimumHeight(28)
+            key = (axis, direction)
+            button.pressed.connect(lambda a=axis, d=direction: self._press(a, d))
+            button.released.connect(lambda a=axis, d=direction: self._release(a, d))
+            self._buttons[key] = button
+            grid.addWidget(button, index // 3, index % 3)
+        root.addLayout(grid, 1)
+        actions = QHBoxLayout()
+        actions.setSpacing(5)
+        zero = QPushButton("ZERO")
+        zero.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        zero.clicked.connect(self.zeroRequested)
+        estop = QPushButton("E-STOP")
+        estop.setObjectName("Danger")
+        estop.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        estop.clicked.connect(self.estopRequested)
+        actions.addWidget(zero)
+        actions.addWidget(estop)
+        actions.addWidget(self._boost)
+        root.addLayout(actions)
+
+    def _update_speed(self, value):
+        self._speed_label.setText(str(int(value)))
+        if self._held:
+            self._emit()
+
+    def _press(self, axis, direction):
+        if not self.isEnabled():
+            return
+        self._held.add((axis, direction))
+        self._emit()
+
+    def _release(self, axis, direction):
+        self._held.discard((axis, direction))
+        self._emit()
+
+    def _emit(self, *_):
+        motion = MotionState(boost=self._boost.isChecked())
+        speed = self._speed.value() / 1000.0
+        for axis in ("surge", "sway", "heave", "yaw", "pitch", "roll"):
+            value = 0.0
+            if (axis, 1.0) in self._held:
+                value += speed
+            if (axis, -1.0) in self._held:
+                value -= speed
+            setattr(motion, axis, max(-1.0, min(1.0, value)))
+        self.motionChanged.emit(motion)
+
+    def clear(self):
+        self._held.clear()
+        self._emit()
+
+    def set_controls_enabled(self, enabled):
+        self.setEnabled(enabled)
+        for button in self._buttons.values():
+            button.setEnabled(enabled)
+        self._speed.setEnabled(enabled)
+        self._boost.setEnabled(enabled)
+
+    def set_speed(self, value):
+        self._speed.setValue(int(value))

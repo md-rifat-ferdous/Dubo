@@ -1,8 +1,28 @@
 thrusters:
   enabled: true
-  provider: simulated
+  provider: uart
+  port: /dev/ttyUSB0
+  baud: 115200
+  fallback_to_simulated: false
+  ramp: 0.1
+  boost_scale: 1.0
   speed_mps: 0.8
   turn_rate_degps: 60.0
+  deadband:
+    positive: 20
+    negative: 176
   layout:
-    horizontal: [FL, FR, BL, BR]
-    vertical: [VT1, VT2]
+    horizontal: [M2, M3]
+    vertical: [M1, M4, M5]
+  mixing:
+    M1: {heave: 1.0, pitch: -1.0}
+    M2: {surge: 1.0, yaw: -1.0}
+    M3: {surge: 1.0, yaw: 1.0}
+    M4: {heave: 1.0, pitch: 1.0, roll: 1.0}
+    M5: {heave: 1.0, pitch: 1.0, roll: -1.0}
+  polarity:
+    M1: 1
+    M2: 1
+    M3: 1
+    M4: 1
+    M5: 1

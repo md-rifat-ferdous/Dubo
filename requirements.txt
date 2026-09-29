@@ -1,0 +1,23 @@
+# Runtime dependencies for the ROV controller.
+# Derived from the third-party imports actually used across app/, core/,
+# modules/, ui/ and scripts/. Versions pinned to the set verified in .venv.
+
+# --- Core ---
+numpy==2.5.1
+opencv-python==5.0.0.93
+PySide6==6.11.1
+pyserial==3.5
+PyYAML==6.0.3
+smbus2==0.6.1
+
+# --- Optional ---
+# CPU/RAM readout in the UI (ui/sections.py, ui/main_window.py). Imported
+# lazily inside a try/except, so the panel shows "--" when it is missing.
+# Not currently installed in the local .venv.
+# psutil>=5.9
+
+# --- Transitive (pinned for reproducible installs) ---
+pillow==12.3.0
+
+# --- Tests ---
+# The suite in tests/ runs on stdlib unittest, so no test dependency is needed.
